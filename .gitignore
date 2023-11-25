@@ -1,0 +1,6 @@
+.vscode
+assets/*
+build
+imgui_log.txt
+imgui.ini
+.log
