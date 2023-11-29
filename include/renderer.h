@@ -10,11 +10,25 @@
 #include"SDL.h"
 #include"SDL_vulkan.h"
 
-#include"tiny_gltf.h"
+#define GLM_FORCE_RADIANS
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
+#include"glm/glm.hpp"
+#include"glm/gtc/matrix_transform.hpp"
+#include"glm/gtc/type_ptr.hpp"
 
 
 #include<vector>
 #include<optional>
+
+namespace vkglTF{
+    class Scene;
+}
+struct CameraDetails{
+    alignas(16) glm::vec3 cameraPosition;
+    alignas(16) glm::vec3 viewDirection;
+    alignas(16) glm::mat4 viewMat;
+    alignas(16) glm::mat4 projectionMat;
+};
 struct QueueFamiliyIndices{
     std::optional<uint32_t> graphicQueueFamily;
     std::optional<uint32_t> computeQueueFamily;
@@ -30,6 +44,7 @@ struct SwapchainDetails{
     vk::Extent2D extent;
 };
 class Renderer{
+    friend class vkglTF::Scene;
 public:
     Renderer();
     ~Renderer();
@@ -48,16 +63,17 @@ private:
     void initDebugMessenger();
     void initSurface();
     void initLogicalDevice();
-    //loading resources
-    //TODO:dynamic loading with imgui select file,now it is just hard-coded
-    void loadGLTF();
-    //rendering stuff
-    void initSwapchain();
-    void reinitSwapchain();
     void initCommandPool();
     void initCommandBuffers();
+    
+    void initglTFScene();
+    
+    //rendering stuff
+    void initSwapchain();
+    void initCamera();
+    void reinitSwapchain();
+    void initDepthResources();
     void initDescriptorPool();
-    void initDescriptorSets();
     void initRenderPass();
     void initFramebuffer();
     void initSyncObjects();
@@ -82,13 +98,29 @@ private:
     void getDeviceFeatures(vk::PhysicalDeviceFeatures& features);
     void getSwapchainDetails();
     vk::ImageView createImageView(vk::Image image,vk::Format format,vk::ImageAspectFlags aspectMask);
+    int getSuitableMemoryTypeIndex(uint32_t memoryTypeBits,vk::MemoryPropertyFlags props);
+    void createImage(vk::Image& image,vk::DeviceMemory& imageMemory,vk::Extent2D extent,vk::Format format,
+                    vk::ImageUsageFlags usages,vk::MemoryPropertyFlags memoryProps);
+    void createBuffer(vk::Buffer& buffer,vk::DeviceMemory& bufferMemory,int size,vk::BufferUsageFlags usages,vk::MemoryPropertyFlags memoryProps);
     vk::ShaderModule createShaderModule(const char* path);
+
+    vk::CommandBuffer startOneShotCommandBuffer(vk::CommandPool cp);
+    void finishOneShotCommandBuffer(vk::CommandPool cp,vk::CommandBuffer cb,vk::Queue q);
 private:
     SDL_Window* sdlWindow;
+    float lastSDLtime = 0.0f;
     bool windowMinimized = false;
+    bool moveLeft=false;
+    bool moveRight=false;
+    bool moveUp=false;
+    bool moveDown=false;
+    bool rightButtonDown=false;
+    float wheelSpeedScale = 0.3;
+    float moveSpeed=2.0;
+    float rotationSpeed=0.1;
+
 private:
-    tinygltf::TinyGLTF gltfLoader;
-    tinygltf::Model gltfModel;
+    vkglTF::Scene* glTFScene;
 private:
     vk::DispatchLoaderDynamic dld;
     vk::Instance vkInstance;
@@ -122,8 +154,14 @@ private:
     vk::Semaphore imageAvaliable;
     vk::Semaphore renderingFinished;
     vk::Fence inflightFence;
+
+    vk::Image depthImage;
+    vk::DeviceMemory depthImageMemory;
+    vk::ImageView depthImageView;
 private:
     int curFrame = 0;
     int maxInFlightFrame = 2;
+
+    CameraDetails camera;
 };
 #endif

@@ -1,9 +1,5 @@
 #include "renderer.h"
-
-#define TINYGLTF_IMPLEMENTATION
-#define STB_IMAGE_IMPLEMENTATION
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include"tiny_gltf.h"
+#include"vkglTF.h"
 
 #include<iostream>
 #include<fstream>
@@ -50,10 +46,13 @@ void Renderer::init()
     initDebugMessenger();
     initSurface();
     initLogicalDevice();
-    initSwapchain();
     initCommandPool();
     initCommandBuffers();
     initDescriptorPool();
+    initglTFScene();
+    initSwapchain();
+    initDepthResources();
+    initCamera();
     initRenderPass();
     initPipelineLayouts();
     initPipelines();
@@ -91,13 +90,17 @@ void Renderer::cleanup()
     lDevice.destroyPipelineLayout(defaultGraphicPipelineLayout);
     lDevice.destroyRenderPass(defaultGraphicRenderPass);
     lDevice.destroyRenderPass(imguiRenderPass);
+       for(int i=0;i<swapchainImageViews.size();++i){
+        lDevice.destroyImageView(swapchainImageViews[i]);
+    }
+    lDevice.destroyImageView(depthImageView);
+    lDevice.destroyImage(depthImage);
+    lDevice.freeMemory(depthImageMemory);
+    lDevice.destroySwapchainKHR(swapchain);
+    delete glTFScene;
     lDevice.destroyDescriptorPool(descriptorPool);
     lDevice.destroyCommandPool(graphicCommandPool);
     lDevice.destroyCommandPool(computeCommandPool);
-    for(int i=0;i<swapchainImageViews.size();++i){
-        lDevice.destroyImageView(swapchainImageViews[i]);
-    }
-    lDevice.destroySwapchainKHR(swapchain);
     lDevice.destroy();
 
     vkInstance.destroySurfaceKHR(surface);
@@ -108,27 +111,130 @@ void Renderer::cleanup()
 }
 bool Renderer::handleEvents(){
     SDL_Event event;
+
     while(SDL_PollEvent(&event)){
+        bool handled = false;
         if(event.type == SDL_QUIT){
+            handled = true;
             return false;
         }
         else if(event.type == SDL_WINDOWEVENT){
             switch(event.window.event){
                 case SDL_WINDOWEVENT_MINIMIZED:
+                    handled = true;
                     windowMinimized = true;
                     break;
                 case SDL_WINDOWEVENT_RESTORED:
                     windowMinimized = false;
+                    handled = true;
                     break;
                 case SDL_WINDOWEVENT_SIZE_CHANGED:
+                    handled = true;
                     reinitSwapchain();
                     break;
+                case SDL_WINDOWEVENT_LEAVE:
+                    handled = true;
+                    moveDown = moveLeft = moveRight = moveUp = false;
+                    rightButtonDown = false;
+                    break;
             }
-            continue;
         }
-
-        ImGui_ImplSDL2_ProcessEvent(&event);
+        else if(event.type == SDL_MOUSEBUTTONDOWN){
+            switch(event.button.button){
+                case SDL_BUTTON_RIGHT:
+                    handled = true;
+                    rightButtonDown = true;
+                    break;
+            }
+        }
+        else if(event.type == SDL_MOUSEBUTTONUP){
+            switch(event.button.button){
+                case SDL_BUTTON_RIGHT:
+                    handled = true;
+                    rightButtonDown = false;
+                    break;
+            }
+        }
+        else if(event.type == SDL_KEYDOWN){
+            switch(event.key.keysym.sym){
+                case SDLK_w:
+                    handled = true;
+                    moveUp = true;
+                    break;
+                case SDLK_a:
+                    handled = true;
+                    moveLeft = true;
+                    break;
+                case SDLK_s:
+                    handled = true;
+                    moveDown = true;
+                    break;
+                case SDLK_d:
+                    handled = true;
+                    moveRight = true;
+                    break;
+            }
+        }
+        else if(event.type == SDL_KEYUP){
+            switch(event.key.keysym.sym){
+                case SDLK_w:
+                    handled = true;
+                    moveUp = false;
+                    break;
+                case SDLK_a:
+                    handled = true;
+                    moveLeft = false;
+                    break;
+                case SDLK_s:
+                    handled = true;
+                    moveDown = false;
+                    break;
+                case SDLK_d:
+                    handled = true;
+                    moveRight = false;
+                    break;
+            }
+        }
+        else if(event.type == SDL_MOUSEWHEEL){
+            handled = true;
+            camera.cameraPosition += wheelSpeedScale*event.wheel.y*moveSpeed*camera.viewDirection;
+        }
+        else if(event.type == SDL_MOUSEMOTION){
+            if(rightButtonDown){
+                handled = true;
+                float xrel = event.motion.xrel;
+                float yrel = event.motion.yrel;
+                glm::mat4 rotation = glm::mat4(1.0f);
+                glm::vec3 x = glm::normalize(glm::cross(camera.viewDirection,glm::vec3(0,1,0)));
+                rotation = glm::rotate(rotation,-glm::radians(rotationSpeed*yrel),x);
+                rotation = glm::rotate(rotation,-glm::radians(rotationSpeed*xrel),glm::vec3(0,1,0));
+                camera.viewDirection = rotation*glm::vec4(camera.viewDirection,0);
+            }
+        }
+        if(!handled){
+            ImGui_ImplSDL2_ProcessEvent(&event);
+        }
+        
     }
+
+    float nowSDLtime = SDL_GetTicks()/1000.0f;
+    float deltaTime = nowSDLtime - lastSDLtime;
+    lastSDLtime = nowSDLtime;
+
+    if(moveLeft){
+        camera.cameraPosition -=  moveSpeed*deltaTime*glm::normalize(glm::cross(camera.viewDirection,glm::vec3(0,1,0)));
+    }
+    if(moveRight){
+        camera.cameraPosition +=  moveSpeed*deltaTime*glm::normalize(glm::cross(camera.viewDirection,glm::vec3(0,1,0)));
+    }
+    if(moveUp){
+        camera.cameraPosition +=  moveSpeed*deltaTime*glm::vec3(0,1,0);
+    }
+    if(moveDown){
+        camera.cameraPosition +=  moveSpeed*deltaTime*glm::vec3(0,-1,0);
+    }
+    camera.viewMat = glm::lookAt(camera.cameraPosition,camera.cameraPosition+camera.viewDirection,glm::vec3{0,1,0});
+
     return true;
 }
 void Renderer::render(){
@@ -143,8 +249,6 @@ void Renderer::render(){
     {
         if(ImGui::Begin("fps")){
             ImGui::BulletText("fps:%.3f",ImGui::GetIO().Framerate);
-            ImGui::SameLine();
-            ImGui::BulletText("fps:%.3f",ImGui::GetIO().Framerate);
         }
         ImGui::End();
     }
@@ -156,9 +260,13 @@ void Renderer::render(){
     beginInfo.setFlags(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
     renderingCommandBuffers.begin(beginInfo);
     vk::RenderPassBeginInfo renderpassBeginInfo;
+
+    vk::ClearValue depthStencilClearValue;
+    depthStencilClearValue.setDepthStencil(vk::ClearDepthStencilValue{1,0});
     std::vector<vk::ClearValue> clearValues = {
-        vk::ClearValue()
+        vk::ClearValue(),depthStencilClearValue
     };
+
     vk::Rect2D area({0,0},swapchainDetails.extent);
     renderpassBeginInfo.setRenderArea(area);
     renderpassBeginInfo.setRenderPass(defaultGraphicRenderPass);
@@ -166,9 +274,19 @@ void Renderer::render(){
     renderpassBeginInfo.setFramebuffer(defaultGraphicFrameBuffers[frameIdx]);
     renderingCommandBuffers.beginRenderPass(renderpassBeginInfo,vk::SubpassContents::eInline);
     renderingCommandBuffers.bindPipeline(vk::PipelineBindPoint::eGraphics,defaultGraphicPipeline);
+    
+    renderingCommandBuffers.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,defaultGraphicPipelineLayout,0,{
+        glTFScene->modelMatsDescriptorSet,
+        glTFScene->materialDescriptorSet
+    },{});
+
+    renderingCommandBuffers.bindVertexBuffers(0,{glTFScene->vertexBuffer},{0});
+    renderingCommandBuffers.bindIndexBuffer(glTFScene->indexBuffer,0,vk::IndexType::eUint32);
+    renderingCommandBuffers.pushConstants<CameraDetails>(defaultGraphicPipelineLayout,vk::ShaderStageFlagBits::eVertex,0,camera);
+
     vk::Viewport viewport;
-    viewport.setMinDepth(0);
-    viewport.setMaxDepth(0);
+    viewport.setMinDepth(0.0f);
+    viewport.setMaxDepth(1.0f);
     viewport.setWidth(swapchainDetails.extent.width);
     viewport.setHeight(swapchainDetails.extent.height);
     viewport.setX(0.0f);
@@ -178,7 +296,7 @@ void Renderer::render(){
     scissor.setOffset({0,0});
     renderingCommandBuffers.setViewport(0,viewport);
     renderingCommandBuffers.setScissor(0,scissor);
-    renderingCommandBuffers.draw(3,1,0,0);
+    renderingCommandBuffers.drawIndexed(glTFScene->indexs.size(),1,0,0,0);
     renderingCommandBuffers.endRenderPass();
 
     renderpassBeginInfo.setRenderPass(imguiRenderPass);
@@ -220,6 +338,7 @@ void Renderer::initSDL()
 void Renderer::initVkInstance()
 {
     vk::ApplicationInfo appInfo;
+    appInfo.setApiVersion(VK_MAKE_API_VERSION(0,1,3,0));
     vk::InstanceCreateInfo createInfo;
     createInfo.setPApplicationInfo(&appInfo);
     std::vector<const char*> layers;
@@ -295,7 +414,17 @@ void Renderer::initImGui()
 void Renderer::initPipelineLayouts()
 {
     {
+        std::vector<vk::DescriptorSetLayout> setLayouts = {
+            glTFScene->modelMatsDescriptorSetLayout,
+            glTFScene->materialDescriptorSetLayout,
+        };
+        vk::PushConstantRange range;
+        range.setOffset(0);
+        range.setSize(sizeof(CameraDetails));
+        range.setStageFlags(vk::ShaderStageFlagBits::eVertex);
         vk::PipelineLayoutCreateInfo createInfo;
+        createInfo.setSetLayouts(setLayouts);
+        createInfo.setPushConstantRanges(range);
         defaultGraphicPipelineLayout = lDevice.createPipelineLayout(createInfo);
     }
 }
@@ -310,13 +439,11 @@ void Renderer::initPipelines()
         colorBlendState.setLogicOpEnable(false);
 
         vk::PipelineDepthStencilStateCreateInfo depthStencilState;
-        depthStencilState.setDepthBoundsTestEnable(true);
         depthStencilState.setDepthCompareOp(vk::CompareOp::eLess);
-        depthStencilState.setDepthTestEnable(false);
-        depthStencilState.setDepthWriteEnable(false);
+        depthStencilState.setDepthTestEnable(true);
+        depthStencilState.setDepthWriteEnable(true);
         depthStencilState.setMaxDepthBounds(1);
         depthStencilState.setMinDepthBounds(0);
-        depthStencilState.setStencilTestEnable(false);
 
         vk::PipelineDynamicStateCreateInfo dynamicStates;
         std::vector<vk::DynamicState> states = {vk::DynamicState::eViewport,vk::DynamicState::eScissor};
@@ -329,9 +456,7 @@ void Renderer::initPipelines()
         multiSampleState.setRasterizationSamples(vk::SampleCountFlagBits::e1);
 
         vk::PipelineRasterizationStateCreateInfo rasterizationState;
-        rasterizationState.setCullMode(vk::CullModeFlagBits::eBack);
-        rasterizationState.setDepthClampEnable(false);
-        rasterizationState.setFrontFace(vk::FrontFace::eClockwise);
+        rasterizationState.setCullMode(vk::CullModeFlagBits::eNone);
         rasterizationState.setPolygonMode(vk::PolygonMode::eFill);
         rasterizationState.setLineWidth(1.0f);
 
@@ -350,10 +475,14 @@ void Renderer::initPipelines()
         vk::PipelineTessellationStateCreateInfo tessellationState;
         
         vk::PipelineVertexInputStateCreateInfo vertexInputState;
+        auto attributeDescriptions = vkglTF::Vertex::getAttributesDescription();
+        vertexInputState.setVertexAttributeDescriptions(attributeDescriptions);
+        auto bindingDescription = vkglTF::Vertex::getBindingDescription();
+        vertexInputState.setVertexBindingDescriptions(bindingDescription);
         
         vk::Viewport viewport;
         viewport.setMinDepth(0);
-        viewport.setMaxDepth(0);
+        viewport.setMaxDepth(1);
         viewport.setWidth(swapchainDetails.extent.width);
         viewport.setHeight(swapchainDetails.extent.height);
         viewport.setX(0.0f);
@@ -413,9 +542,27 @@ void Renderer::pickPhysicalDevice()
 }
 bool Renderer::checkPhysicalDevice(vk::PhysicalDevice pdevice)
 {
-    bool result = true;
-    result&=pickQueueFamilies(pdevice);
-    return result;
+    std::vector<const char*> exts;
+    uint32_t extCount = getDeviceExts(exts);
+    
+    std::vector<vk::ExtensionProperties> pdeviceExts = pdevice.enumerateDeviceExtensionProperties();
+    for(int i=0;i<extCount;++i){
+        bool found = false;
+        for(auto& pdeviceExt:pdeviceExts){
+            if(std::strcmp(exts[i],pdeviceExt.extensionName)==0){
+                found = true;
+                break;
+            }
+        }
+        if(!found){
+            return false;
+        }
+    }
+
+    if(!pickQueueFamilies(pdevice)){
+        return false;
+    }
+    return true;
 }
 bool Renderer::pickQueueFamilies(vk::PhysicalDevice pdevice)
 {
@@ -517,6 +664,94 @@ vk::ShaderModule Renderer::createShaderModule(const char *path)
     return shaderModule;
 }
 
+vk::CommandBuffer Renderer::startOneShotCommandBuffer(vk::CommandPool cp)
+{
+    vk::CommandBufferAllocateInfo commandBufferInfo;
+    commandBufferInfo.setCommandBufferCount(1);
+    commandBufferInfo.setCommandPool(graphicCommandPool);
+    commandBufferInfo.setLevel(vk::CommandBufferLevel::ePrimary);
+    vk::CommandBuffer cb = lDevice.allocateCommandBuffers(commandBufferInfo)[0];
+    vk::CommandBufferBeginInfo beginInfo{};
+    beginInfo.setFlags(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
+    cb.begin(beginInfo);
+    return cb;
+}
+
+void Renderer::finishOneShotCommandBuffer(vk::CommandPool cp,vk::CommandBuffer cb,vk::Queue q)
+{
+    cb.end();
+    vk::SubmitInfo submitInfo;
+    submitInfo.setCommandBuffers(cb);
+    q.submit(submitInfo);
+    lDevice.waitIdle();
+    lDevice.freeCommandBuffers(cp,cb);
+}
+
+int Renderer::getSuitableMemoryTypeIndex(uint32_t memoryTypeBits,vk::MemoryPropertyFlags props)
+{
+    vk::PhysicalDeviceMemoryProperties memoryProperties = pDevice.getMemoryProperties();
+    for(int i=0;i<memoryProperties.memoryTypeCount;++i){
+        vk::MemoryType type = memoryProperties.memoryTypes[i];
+        if(type.propertyFlags&props){
+            if((1<<i)&memoryTypeBits){
+                return i;
+            }
+        }
+    }
+    throw std::runtime_error("failed to find a suitable memory type!");
+    return -1;
+}
+
+void Renderer::createImage(vk::Image& image,vk::DeviceMemory& imageMemory,vk::Extent2D extent,vk::Format format,
+                           vk::ImageUsageFlags usages,vk::MemoryPropertyFlags memoryProps)
+{
+    vk::ImageCreateInfo createInfo;
+    createInfo.setArrayLayers(1);
+    createInfo.setExtent(vk::Extent3D{extent,1});
+    createInfo.setFormat(format);
+    createInfo.setImageType(vk::ImageType::e2D);
+    createInfo.setInitialLayout(vk::ImageLayout::eUndefined);
+    createInfo.setMipLevels(1);
+    createInfo.setQueueFamilyIndices(queueFamilyIndices.graphicQueueFamily.value());
+    createInfo.setSamples(vk::SampleCountFlagBits::e1);
+    createInfo.setSharingMode(vk::SharingMode::eExclusive);
+    createInfo.setTiling(vk::ImageTiling::eOptimal);
+    createInfo.setUsage(usages);
+    image = lDevice.createImage(createInfo);
+
+    vk::MemoryRequirements requirements = lDevice.getImageMemoryRequirements(image);
+    int memoryTypeIndex = getSuitableMemoryTypeIndex(requirements.memoryTypeBits,memoryProps);
+    vk::MemoryAllocateInfo allocateInfo;
+    allocateInfo.setAllocationSize(requirements.size);
+    allocateInfo.setMemoryTypeIndex(memoryTypeIndex);
+    imageMemory = lDevice.allocateMemory(allocateInfo);
+    lDevice.bindImageMemory(image,imageMemory,0);
+}
+
+void Renderer::createBuffer(vk::Buffer& buffer,vk::DeviceMemory& bufferMemory,int size,vk::BufferUsageFlags usages,vk::MemoryPropertyFlags memoryProps)
+{
+    vk::BufferCreateInfo bufferInfo;
+    if(queueFamilyIndices.computeQueueFamily.value() == queueFamilyIndices.graphicQueueFamily.value()){
+        bufferInfo.setQueueFamilyIndices(queueFamilyIndices.computeQueueFamily.value());
+        bufferInfo.setSharingMode(vk::SharingMode::eExclusive);
+    }
+    else{
+        bufferInfo.setSharingMode(vk::SharingMode::eConcurrent);
+        std::vector<uint32_t> indices = {queueFamilyIndices.computeQueueFamily.value(),queueFamilyIndices.graphicQueueFamily.value()};
+        bufferInfo.setQueueFamilyIndices(indices);
+    }
+    bufferInfo.setUsage(usages);
+    bufferInfo.setSize(size);
+    buffer = lDevice.createBuffer(bufferInfo);
+    vk::MemoryRequirements requirements = lDevice.getBufferMemoryRequirements(buffer);
+    int memoryTypeIndex = getSuitableMemoryTypeIndex(requirements.memoryTypeBits,memoryProps);
+    vk::MemoryAllocateInfo allocateInfo;
+    allocateInfo.setAllocationSize(requirements.size);
+    allocateInfo.setMemoryTypeIndex(memoryTypeIndex);
+    bufferMemory = lDevice.allocateMemory(allocateInfo);
+    lDevice.bindBufferMemory(buffer,bufferMemory,0);
+}
+
 void Renderer::initLogicalDevice()
 {
     pickPhysicalDevice();
@@ -544,19 +779,14 @@ void Renderer::initLogicalDevice()
         queueInfos.push_back(queueInfo);
     }
     deviceInfo.setQueueCreateInfos(queueInfos);
+    vk::PhysicalDeviceDescriptorIndexingFeatures diFeatures;
+    diFeatures.setDescriptorBindingPartiallyBound(true);
+    deviceInfo.setPNext(&diFeatures);
     lDevice = pDevice.createDevice(deviceInfo);
 
     computeQueue = lDevice.getQueue(queueFamilyIndices.computeQueueFamily.value(),0);
     graphicQueue = lDevice.getQueue(queueFamilyIndices.graphicQueueFamily.value(),0);
     presentQueue = lDevice.getQueue(queueFamilyIndices.presentQueueFamily.value(),0);
-}
-void Renderer::loadGLTF()
-{
-    const char* fileName = "./cude/Cude.gltf";
-    std::string err;
-    std::string warn;
-    gltfLoader.LoadASCIIFromFile(&gltfModel,&err,&warn,fileName);
-    
 }
 void Renderer::initSwapchain()
 {
@@ -610,6 +840,18 @@ void Renderer::initSwapchain()
         swapchainImageViews[i] = createImageView(swapchainImages[i],swapchainDetails.format.format,vk::ImageAspectFlagBits::eColor);
     }
 }
+void Renderer::initCamera()
+{
+    //sponza
+    // camera.cameraPosition = {10,3,0};
+    // camera.viewDirection = glm::normalize(glm::vec3(-10,-1,0));
+    camera.cameraPosition = {3,3,3};
+    //damgedHelmet
+    camera.viewDirection = glm::normalize(glm::vec3(-1,-1,-1));
+    camera.viewMat = glm::lookAt(camera.cameraPosition,camera.cameraPosition+camera.viewDirection,glm::vec3{0,1,0});
+    camera.projectionMat = glm::perspective(glm::radians(45.0f),1.0f*swapchainDetails.extent.width/swapchainDetails.extent.height,0.01f,1000.0f);
+    camera.projectionMat[1][1] *= -1;
+}
 void Renderer::reinitSwapchain()
 {
     lDevice.waitIdle();
@@ -619,9 +861,31 @@ void Renderer::reinitSwapchain()
     for(int i=0;i<swapchainImageViews.size();++i){
         lDevice.destroyImageView(swapchainImageViews[i]);
     }
+    lDevice.destroyImageView(depthImageView);
+    lDevice.destroyImage(depthImage);
+    lDevice.freeMemory(depthImageMemory);
     lDevice.destroySwapchainKHR(swapchain);
     initSwapchain();
+    initDepthResources();
     initFramebuffer();
+}
+void Renderer::initDepthResources()
+{
+    createImage(depthImage,depthImageMemory,swapchainDetails.extent,vk::Format::eD32SfloatS8Uint,
+    vk::ImageUsageFlagBits::eDepthStencilAttachment,vk::MemoryPropertyFlagBits::eDeviceLocal);
+    depthImageView = createImageView(depthImage,vk::Format::eD32SfloatS8Uint,vk::ImageAspectFlagBits::eDepth);
+    vk::CommandBuffer cb = startOneShotCommandBuffer(graphicCommandPool);
+    vk::ImageMemoryBarrier imageBarrier;
+    imageBarrier.setImage(depthImage);
+    imageBarrier.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eDepth|vk::ImageAspectFlagBits::eStencil;
+    imageBarrier.subresourceRange.layerCount = 1;
+    imageBarrier.subresourceRange.levelCount = 1;
+    imageBarrier.setSrcAccessMask(vk::AccessFlags(0));
+    imageBarrier.setDstAccessMask(vk::AccessFlagBits::eDepthStencilAttachmentRead|vk::AccessFlagBits::eDepthStencilAttachmentWrite);
+    imageBarrier.setOldLayout(vk::ImageLayout::eUndefined);
+    imageBarrier.setNewLayout(vk::ImageLayout::eDepthStencilAttachmentOptimal);
+    cb.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,vk::PipelineStageFlagBits::eEarlyFragmentTests,vk::DependencyFlags(0),{},{},imageBarrier);
+    finishOneShotCommandBuffer(graphicCommandPool,cb,graphicQueue);
 }
 void Renderer::initCommandPool()
 {
@@ -646,13 +910,26 @@ void Renderer::initCommandBuffers()
     allocateInfo.setLevel(vk::CommandBufferLevel::ePrimary);
     renderingCommandBuffers = lDevice.allocateCommandBuffers(allocateInfo)[0];
 }
+void Renderer::initglTFScene()
+{
+    vkglTF::VkBase vkBase;
+    vkBase.commandPool = graphicCommandPool;
+    vkBase.device = lDevice;
+    vkBase.physicalDevice = pDevice;
+    vkBase.graphicQueue = graphicQueue;
+    vkBase.graphicQueueFamily = queueFamilyIndices.graphicQueueFamily.value();
+    glTFScene = new vkglTF::Scene(this);
+    glTFScene->loadFile("assets/damagedHelmet/DamagedHelmet.gltf");
+}
 void Renderer::initDescriptorPool()
 {
-    std::array<vk::DescriptorPoolSize,1> poolSizes = {
-        vk::DescriptorPoolSize(vk::DescriptorType::eCombinedImageSampler,8)
+    std::array<vk::DescriptorPoolSize,3> poolSizes = {
+        vk::DescriptorPoolSize(vk::DescriptorType::eCombinedImageSampler,1024),
+        vk::DescriptorPoolSize(vk::DescriptorType::eUniformBuffer,1024),
+        vk::DescriptorPoolSize(vk::DescriptorType::eStorageBuffer,8),
     };
     vk::DescriptorPoolCreateInfo poolInfo;
-    poolInfo.setMaxSets(8);
+    poolInfo.setMaxSets(16);
     poolInfo.setPoolSizes(poolSizes);
     
     descriptorPool = lDevice.createDescriptorPool(poolInfo);
@@ -699,21 +976,34 @@ void Renderer::initRenderPass()
         vk::AttachmentDescription colorAttachment;
         colorAttachment.setFormat(swapchainDetails.format.format);
         colorAttachment.setInitialLayout(vk::ImageLayout::eUndefined);
-        //after that,ui should be draw.
         colorAttachment.setFinalLayout(vk::ImageLayout::eColorAttachmentOptimal);
 
         colorAttachment.setLoadOp(vk::AttachmentLoadOp::eClear);
         colorAttachment.setStoreOp(vk::AttachmentStoreOp::eStore);
         colorAttachment.setSamples(vk::SampleCountFlagBits::e1);
+
+        vk::AttachmentDescription depthAttachment;
+        depthAttachment.setFormat(vk::Format::eD32SfloatS8Uint);
+        depthAttachment.setInitialLayout(vk::ImageLayout::eDepthStencilAttachmentOptimal);
+        depthAttachment.setFinalLayout(vk::ImageLayout::eDepthStencilAttachmentOptimal);
+
+        depthAttachment.setLoadOp(vk::AttachmentLoadOp::eClear);
+        depthAttachment.setStoreOp(vk::AttachmentStoreOp::eDontCare);
+        depthAttachment.setSamples(vk::SampleCountFlagBits::e1);
+
         std::vector<vk::AttachmentDescription> attachments = {
-            colorAttachment,
+            colorAttachment,depthAttachment
         };
         vk::AttachmentReference ref_colorAttachment;
         ref_colorAttachment.setAttachment(0);
         ref_colorAttachment.setLayout(vk::ImageLayout::eColorAttachmentOptimal);
+        vk::AttachmentReference ref_depthAttachment;
+        ref_depthAttachment.setAttachment(1);
+        ref_depthAttachment.setLayout(vk::ImageLayout::eDepthStencilAttachmentOptimal);
 
         vk::SubpassDescription defaultSubpassInfo;
         defaultSubpassInfo.setColorAttachments(ref_colorAttachment);
+        defaultSubpassInfo.setPDepthStencilAttachment(&ref_depthAttachment);
         defaultSubpassInfo.setPipelineBindPoint(vk::PipelineBindPoint::eGraphics);
         std::vector<vk::SubpassDescription> subpasses = {
             defaultSubpassInfo
@@ -741,7 +1031,8 @@ void Renderer::initFramebuffer()
     }
     for(int i=0;i<defaultGraphicFrameBuffers.size();++i){
         vk::FramebufferCreateInfo framebufferInfo;
-        framebufferInfo.setAttachments(swapchainImageViews[i]);
+        std::array<vk::ImageView,2> attachments = {swapchainImageViews[i],depthImageView};
+        framebufferInfo.setAttachments(attachments);
         framebufferInfo.setWidth(swapchainDetails.extent.width);
         framebufferInfo.setHeight(swapchainDetails.extent.height);
         framebufferInfo.setLayers(1);
